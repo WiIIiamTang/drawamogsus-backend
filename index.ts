@@ -162,6 +162,10 @@ io.on("connection", (socket) => {
   });
 
   socket.on("game_start", (room: string, name: string) => {
+    if (!rooms[room]) {
+      console.log("room does not exist");
+      return;
+    }
     // add a role to each user in the room
     const imposterIndex = Math.floor(Math.random() * rooms[room].length);
     // pick a random index to draw first
