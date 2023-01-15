@@ -2,6 +2,8 @@ import express from "express";
 import http from "http";
 import { Server } from "socket.io";
 import dotenv from "dotenv";
+import wordlist from "./fruitsandvegetables.js";
+import { stringify } from "querystring";
 
 dotenv.config();
 
@@ -35,6 +37,9 @@ type DrawLine = {
 type User = {
   id: string;
   name: string;
+  role?: string | null;
+  firstdraw?: boolean;
+  hasDrawn?: boolean;
 };
 
 type Dic = {
@@ -64,17 +69,27 @@ io.on("connection", (socket) => {
 
   socket.on(
     "join_room",
-    (room: string, name: string, callback: (success: boolean) => void) => {
+    (
+      room: string,
+      name: string,
+      callback: (success: boolean, takenNickname: boolean) => void
+    ) => {
       if (!rooms[room]) {
         socket.emit("room_does_not_exist");
-        callback(false);
+        callback(false, false);
+        return;
+      }
+      // check if name is taken
+      const takenNickname = rooms[room].find((user) => user.name === name);
+      if (takenNickname) {
+        callback(false, true);
         return;
       }
       socket.join(room);
       rooms[room].push({ id: socket.id, name: name });
       io.to(room).emit("joined_room", room, name);
       console.log("joined room", room);
-      callback(true);
+      callback(true, false);
     }
   );
 
@@ -145,6 +160,98 @@ io.on("connection", (socket) => {
 
     io.emit("left_room_dc", username);
   });
+
+  socket.on("game_start", (room: string, name: string) => {
+    // add a role to each user in the room
+    const imposterIndex = Math.floor(Math.random() * rooms[room].length);
+    // pick a random index to draw first
+    const firstDrawIndex = Math.floor(Math.random() * rooms[room].length);
+    rooms[room].forEach((user, index) => {
+      // pick a random index to be the imposter
+      if (index === imposterIndex) {
+        user.role = "imposter";
+      } else {
+        user.role = "artist"; // others are normal
+      }
+
+      if (index === firstDrawIndex) {
+        user.firstdraw = true;
+        user.hasDrawn = true;
+      } else {
+        user.firstdraw = false;
+        user.hasDrawn = false;
+      }
+    });
+    io.to(room).emit("game_start", name);
+
+    // pick a random word from the wordlist
+    // this is using a sample wordlist for now
+    // need to change to grab from a database or api
+    const word = wordlist[Math.floor(Math.random() * wordlist.length)];
+
+    // get the user who is drawing
+    const firstdrawer = rooms[room].find((user) => user.firstdraw);
+
+    // assign roles to each user through a private message to each socket in the room
+    rooms[room].forEach((user) => {
+      io.to(user.id).emit(
+        "assign_role",
+        user.role,
+        user.firstdraw,
+        user.role === "artist" ? word : null,
+        firstdrawer?.name
+      );
+    });
+  });
+
+  // callback for when drawing is done
+  socket.on(
+    "done_drawing",
+    (
+      room: string,
+      nickname: string,
+      word: string,
+      round: number,
+      callback: (shouldDrawNext: boolean, round: number) => void
+    ) => {
+      console.log("server for room:", room, " at round: ", round);
+      let newround = round;
+      // find a random user who has not drawn yet
+      const nextdrawer = rooms[room].find((user) => !user.hasDrawn);
+      if (!nextdrawer) {
+        // if no one left to draw, increment the round number
+        newround++;
+        console.log("new round", newround);
+        // if round is >= 2, then 2 rounds are complete, so end the game
+        if (newround >= 2) {
+          // reset hasDrawn, firstDraw for everyone
+          rooms[room].forEach((user) => {
+            user.hasDrawn = false;
+            user.firstdraw = false;
+          });
+          io.to(room).emit("game_end");
+          return;
+        }
+        // otherwise, reset the hasDrawn flag for everyone
+        rooms[room].forEach((user) => (user.hasDrawn = false));
+        // and find a new drawer
+        const newdrawer = rooms[room].find((user) => !user.hasDrawn);
+
+        if (newdrawer) {
+          callback(newdrawer.name === nickname, newround);
+          // emit to all other users the new drawer
+          socket.to(room).emit("new_drawer", newdrawer.name, newround);
+          newdrawer.hasDrawn = true;
+        }
+      } else {
+        // this means the round is not over, since more people need to draw
+        callback(nextdrawer.name === nickname, newround);
+        // emit to all other users the new drawer
+        socket.to(room).emit("new_drawer", nextdrawer.name, newround);
+        nextdrawer.hasDrawn = true;
+      }
+    }
+  );
 
   console.log("a user connected", socket.id);
 });
