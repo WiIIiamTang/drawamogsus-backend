@@ -4,10 +4,12 @@ import { Server } from "socket.io";
 import dotenv from "dotenv";
 import wordlist from "./fruitsandvegetables.js";
 import { stringify } from "querystring";
+import mysql, { RowDataPacket } from "mysql2";
 
 dotenv.config();
 
 const app = express();
+const connection = mysql.createConnection(process.env.DATABASE_URL || "");
 
 app.get("/health/healthcheck", (req, res) => {
   res.send("OK");
@@ -40,13 +42,45 @@ type User = {
   role?: string | null;
   firstdraw?: boolean;
   hasDrawn?: boolean;
+  voteCallback?: (
+    scores: Array<userScore>,
+    imposter: string,
+    users_fooled: number
+  ) => void;
+  score?: number;
+  fooled?: boolean;
+};
+
+type userScore = {
+  name: string;
+  score: number;
 };
 
 type Dic = {
   [key: string]: Array<User>;
 };
 
+type RoomSetting = {
+  timeBeforeStart: number;
+  timeDraw: number;
+  timeVote: number;
+  numberRounds: number;
+  wordCategory?: string;
+  word?: string;
+};
+
+type RoomSettings = {
+  [room: string]: RoomSetting;
+};
+
+interface WordlistWord extends RowDataPacket {
+  word?: string;
+  category?: string;
+  difficulty?: string;
+}
+
 const rooms: Dic = {};
+const roomSettings: RoomSettings = {};
 
 io.on("connection", (socket) => {
   socket.on(
@@ -72,24 +106,42 @@ io.on("connection", (socket) => {
     (
       room: string,
       name: string,
-      callback: (success: boolean, takenNickname: boolean) => void
+      callback: (
+        success: boolean,
+        takenNickname: boolean,
+        timeToStart: number,
+        timeToDraw: number,
+        timeToVote: number,
+        rounds: number,
+        userScores: Array<userScore>
+      ) => void
     ) => {
       if (!rooms[room]) {
         socket.emit("room_does_not_exist");
-        callback(false, false);
+        callback(false, false, -1, -1, -1, -1, []);
         return;
       }
       // check if name is taken
       const takenNickname = rooms[room].find((user) => user.name === name);
       if (takenNickname) {
-        callback(false, true);
+        callback(false, true, -1, -1, -1, -1, []);
         return;
       }
       socket.join(room);
       rooms[room].push({ id: socket.id, name: name });
       io.to(room).emit("joined_room", room, name);
-      console.log("joined room", room);
-      callback(true, false);
+      const settings = roomSettings[room];
+      callback(
+        true,
+        false,
+        settings.timeBeforeStart,
+        settings.timeDraw,
+        settings.timeVote,
+        settings.numberRounds,
+        rooms[room].map((user) => {
+          return { name: user.name, score: user.score || 0 };
+        })
+      );
     }
   );
 
@@ -102,12 +154,28 @@ io.on("connection", (socket) => {
 
   socket.on(
     "create_room",
-    (room: string, name: string, callback: (success: boolean) => void) => {
+    (
+      room: string,
+      name: string,
+      numberRounds: number,
+      timeDraw: number,
+      timeBeforeStart: number,
+      timeVote: number,
+      wordCategory: string,
+      callback: (success: boolean) => void
+    ) => {
       if (rooms[room]) {
         socket.emit("room_exists");
         callback(false);
         return;
       }
+      roomSettings[room] = {
+        numberRounds: numberRounds,
+        timeDraw: timeDraw,
+        timeBeforeStart: timeBeforeStart,
+        timeVote: timeVote,
+        wordCategory: wordCategory,
+      };
       rooms[room] = [];
       rooms[room].push({ id: socket.id, name: name });
       socket.join(room);
@@ -123,10 +191,10 @@ io.on("connection", (socket) => {
     rooms[room] = rooms[room].filter((user) => user.id !== socket.id);
     socket.leave(room);
     io.to(room).emit("left_room", room, name);
-    console.log("left room", room);
 
     if (rooms[room].length === 0) {
       delete rooms[room];
+      delete roomSettings[room];
     }
   });
 
@@ -148,7 +216,6 @@ io.on("connection", (socket) => {
   // });
 
   socket.on("disconnect", () => {
-    console.log("user disconnected", socket.id);
     // find user name based on their id
     const room = Object.keys(rooms).find((room) =>
       rooms[room].find((user) => user.id === socket.id)
@@ -163,7 +230,6 @@ io.on("connection", (socket) => {
 
   socket.on("game_start", (room: string, name: string) => {
     if (!rooms[room]) {
-      console.log("room does not exist");
       return;
     }
     // add a role to each user in the room
@@ -185,26 +251,42 @@ io.on("connection", (socket) => {
         user.firstdraw = false;
         user.hasDrawn = false;
       }
+
+      user.voteCallback = undefined;
+      user.fooled = undefined;
     });
     io.to(room).emit("game_start", name);
 
-    // pick a random word from the wordlist
-    // this is using a sample wordlist for now
-    // need to change to grab from a database or api
-    const word = wordlist[Math.floor(Math.random() * wordlist.length)];
+    let sql = `SELECT word FROM wordlist WHERE category='${
+      roomSettings[room].wordCategory || "animal"
+    }' ORDER BY RAND() LIMIT 1`;
+    let word = "";
 
-    // get the user who is drawing
-    const firstdrawer = rooms[room].find((user) => user.firstdraw);
+    connection.query<WordlistWord[]>(sql, (err, result) => {
+      if (err) {
+        throw err;
+      }
 
-    // assign roles to each user through a private message to each socket in the room
-    rooms[room].forEach((user) => {
-      io.to(user.id).emit(
-        "assign_role",
-        user.role,
-        user.firstdraw,
-        user.role === "artist" ? word : null,
-        firstdrawer?.name
-      );
+      if (result[0].word) {
+        word = result[0].word;
+        roomSettings[room].word = word;
+
+        // get the user who is drawing
+        const firstdrawer = rooms[room].find((user) => user.firstdraw);
+
+        // assign roles to each user through a private message to each socket in the room
+        rooms[room].forEach((user) => {
+          io.to(user.id).emit(
+            "assign_role",
+            user.role,
+            user.firstdraw,
+            user.role === "artist" ? word : null,
+            firstdrawer?.name
+          );
+        });
+      } else {
+        throw err;
+      }
     });
   });
 
@@ -218,22 +300,22 @@ io.on("connection", (socket) => {
       round: number,
       callback: (shouldDrawNext: boolean, round: number) => void
     ) => {
-      console.log("server for room:", room, " at round: ", round);
       let newround = round;
       // find a random user who has not drawn yet
       const nextdrawer = rooms[room].find((user) => !user.hasDrawn);
       if (!nextdrawer) {
         // if no one left to draw, increment the round number
         newround++;
-        console.log("new round", newround);
         // if round is >= 2, then 2 rounds are complete, so end the game
-        if (newround >= 2) {
+        if (newround >= roomSettings[room].numberRounds) {
           // reset hasDrawn, firstDraw for everyone
           rooms[room].forEach((user) => {
             user.hasDrawn = false;
             user.firstdraw = false;
+            user.fooled = false;
           });
           io.to(room).emit("game_end");
+          io.to(room).emit("show_public_word", roomSettings[room].word);
           return;
         }
         // otherwise, reset the hasDrawn flag for everyone
@@ -244,20 +326,94 @@ io.on("connection", (socket) => {
         if (newdrawer) {
           callback(newdrawer.name === nickname, newround);
           // emit to all other users the new drawer
-          socket.to(room).emit("new_drawer", newdrawer.name, newround);
+          io.to(room).emit("new_drawer", newdrawer.name, newround);
           newdrawer.hasDrawn = true;
         }
       } else {
         // this means the round is not over, since more people need to draw
         callback(nextdrawer.name === nickname, newround);
         // emit to all other users the new drawer
-        socket.to(room).emit("new_drawer", nextdrawer.name, newround);
+        io.to(room).emit("new_drawer", nextdrawer.name, newround);
         nextdrawer.hasDrawn = true;
       }
     }
   );
 
-  console.log("a user connected", socket.id);
+  socket.on(
+    "send_vote",
+    (
+      room: string,
+      votefor: string,
+      nickname: string,
+      userScores: Array<userScore>,
+      callback: (
+        scores: Array<userScore>,
+        imposter: string,
+        users_fooled: number
+      ) => void
+    ) => {
+      // save the callback function to be called when all players are done voting.
+      // this is to prevent the server from sending the scores to the players before all players have voted
+      if (!rooms[room]) {
+        return;
+      }
+      let user_fooled = 0;
+
+      rooms[room].forEach((user) => {
+        if (user.name === nickname) {
+          user.voteCallback = callback;
+          // compute new scores for the user in the room (just this socket)
+          if (!user.score) {
+            user.score = 0;
+          }
+          if (
+            rooms[room].find((u) => u.role === "imposter")?.name === votefor
+          ) {
+            if (user.role !== "imposter") {
+              user.score += 100;
+            }
+          } else {
+            if (user.role !== "imposter") {
+              user_fooled++;
+              user.fooled = true;
+            }
+          }
+        }
+      });
+
+      // set the imposter score from this players result
+      rooms[room].forEach((user) => {
+        if (user.role === "imposter") {
+          if (!user.score) {
+            user.score = 0;
+          }
+          user.score += 50 * user_fooled;
+        }
+      });
+
+      // check if all players have voted
+      const allVoted = rooms[room].every((user) => user.voteCallback);
+      if (allVoted) {
+        // create an array of UserScore objects to send to the client
+        const scores: Array<userScore> = rooms[room].map((user) => {
+          return {
+            name: user.name || "",
+            score: user.score || 0,
+          };
+        });
+        // run the callback for each user
+        rooms[room].forEach((user) => {
+          if (user.voteCallback) {
+            user.voteCallback(
+              scores,
+              rooms[room].find((u) => u.role === "imposter")?.name || "",
+              rooms[room].reduce((acc, u) => (u.fooled ? acc + 1 : acc), 0)
+            );
+          }
+        });
+      }
+    }
+  );
 });
 
 const PORT = process.env.PORT || 3001;
