@@ -67,6 +67,7 @@ type RoomSetting = {
   numberRounds: number;
   wordCategory?: string;
   word?: string;
+  useFakeWords?: boolean;
 };
 
 type RoomSettings = {
@@ -162,6 +163,7 @@ io.on("connection", (socket) => {
       timeBeforeStart: number,
       timeVote: number,
       wordCategory: string,
+      useFakeWords: boolean,
       callback: (success: boolean) => void
     ) => {
       if (rooms[room]) {
@@ -175,7 +177,9 @@ io.on("connection", (socket) => {
         timeBeforeStart: timeBeforeStart,
         timeVote: timeVote,
         wordCategory: wordCategory,
+        useFakeWords: useFakeWords,
       };
+      console.log(roomSettings[room].useFakeWords);
       rooms[room] = [];
       rooms[room].push({ id: socket.id, name: name });
       socket.join(room);
@@ -259,7 +263,7 @@ io.on("connection", (socket) => {
 
     let sql = `SELECT word FROM wordlist WHERE category='${
       roomSettings[room].wordCategory || "animal"
-    }' ORDER BY RAND() LIMIT 1`;
+    }' ORDER BY RAND() LIMIT 2`;
     let word = "";
 
     connection.query<WordlistWord[]>(sql, (err, result) => {
@@ -267,7 +271,7 @@ io.on("connection", (socket) => {
         throw err;
       }
 
-      if (result[0].word) {
+      if (result[0].word && result[1].word) {
         word = result[0].word;
         roomSettings[room].word = word;
 
@@ -275,14 +279,43 @@ io.on("connection", (socket) => {
         const firstdrawer = rooms[room].find((user) => user.firstdraw);
 
         // assign roles to each user through a private message to each socket in the room
-        rooms[room].forEach((user) => {
-          io.to(user.id).emit(
-            "assign_role",
-            user.role,
-            user.firstdraw,
-            user.role === "artist" ? word : null,
-            firstdrawer?.name
-          );
+        let artists;
+        let fakeWordIndex: number | undefined;
+        if (roomSettings[room].useFakeWords) {
+          // pick one user that is an artist to have a fake word
+          artists = rooms[room].map((user, i) => {
+            if (i !== imposterIndex) {
+              return i;
+            }
+          });
+          // remove undefined
+          artists = artists.filter((useri) => useri !== undefined);
+          if (artists.length > 0)
+            fakeWordIndex = artists[Math.floor(Math.random() * artists.length)];
+        }
+
+        rooms[room].forEach((user, i) => {
+          if (
+            fakeWordIndex !== undefined &&
+            roomSettings[room].useFakeWords &&
+            i === fakeWordIndex
+          ) {
+            io.to(user.id).emit(
+              "assign_role",
+              user.role,
+              user.firstdraw,
+              result[1].word,
+              firstdrawer?.name
+            );
+          } else {
+            io.to(user.id).emit(
+              "assign_role",
+              user.role,
+              user.firstdraw,
+              user.role === "artist" ? word : null,
+              firstdrawer?.name
+            );
+          }
         });
       } else {
         throw err;
