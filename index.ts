@@ -179,7 +179,6 @@ io.on("connection", (socket) => {
         wordCategory: wordCategory,
         useFakeWords: useFakeWords,
       };
-      console.log(roomSettings[room].useFakeWords);
       rooms[room] = [];
       rooms[room].push({ id: socket.id, name: name });
       socket.join(room);
